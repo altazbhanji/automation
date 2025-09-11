@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM role for member accounts to allow central idle instance shutdown'
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: 'AWS Account ID of the central account that will assume this role'
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: 'Must be a valid 12-digit AWS Account ID'
+  
+  RoleName:
+    Type: String
+    Default: 'IdleInstanceShutdownRole'
+    Description: 'Name of the IAM role to create'
+  
+  UseExternalId:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: 'Whether to require an external ID for role assumption'
+  
+  ExternalId:
+    Type: String
+    Default: ''
+    Description: 'External ID to require (only used when UseExternalId=true)'
+
+Conditions:
+  UseExtId: !Equals [!Ref UseExternalId, 'true']
+
+Resources:
+  IdleInstanceShutdownMemberRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${CentralAccountId}:root'
+            Action: sts:AssumeRole
+            Condition: !If
+              - UseExtId
+              - StringEquals:
+                  'sts:ExternalId': !Ref ExternalId
+              - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: IdleInstanceShutdownMemberPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstanceAttribute
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Description: 'ARN of the created IAM role'
+    Value: !GetAtt IdleInstanceShutdownMemberRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-role-arn'
+  
+  RoleName:
+    Description: 'Name of the created IAM role'
+    Value: !Ref IdleInstanceShutdownMemberRole
+    Export:
+      Name: !Sub '${AWS::StackName}-role-name'
+  
+  Instructions:
+    Description: 'Instructions for the central account'
+    Value: !Sub 'Deploy the central account template with CrossAccountRoleName parameter set to ${RoleName}'

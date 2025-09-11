@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Alternative CloudFormation template using CloudWatch Alarms to shut down idle EC2 instances'
+
+Parameters:
+  CPUThresholdPercent:
+    Type: Number
+    Default: 5
+    Description: 'CPU utilization threshold below which an instance is considered idle'
+    MinValue: 1
+    MaxValue: 50
+  
+  EvaluationPeriods:
+    Type: Number
+    Default: 12
+    Description: 'Number of periods (5 min each) to evaluate before triggering alarm (default: 60 minutes)'
+    MinValue: 2
+    MaxValue: 288
+  
+  InstanceTagKey:
+    Type: String
+    Default: 'AutoShutdown'
+    Description: 'Tag key to identify instances that should be monitored for auto-shutdown'
+  
+  InstanceTagValue:
+    Type: String
+    Default: 'enabled'
+    Description: 'Tag value to identify instances that should be monitored for auto-shutdown'
+
+Resources:
+  CloudWatchShutdownRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-cloudwatch-shutdown-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StopInstancesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  AlarmCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-alarm-creator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AlarmCreatorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          CPU_THRESHOLD: !Ref CPUThresholdPercent
+          EVALUATION_PERIODS: !Ref EvaluationPeriods
+          TAG_KEY: !Ref InstanceTagKey
+          TAG_VALUE: !Ref InstanceTagValue
+          CLOUDWATCH_ROLE_ARN: !GetAtt CloudWatchShutdownRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              cloudwatch = boto3.client('cloudwatch')
+              events = boto3.client('events')
+              
+              cpu_threshold = float(os.environ['CPU_THRESHOLD'])
+              evaluation_periods = int(os.environ['EVALUATION_PERIODS'])
+              tag_key = os.environ['TAG_KEY']
+              tag_value = os.environ['TAG_VALUE']
+              role_arn = os.environ['CLOUDWATCH_ROLE_ARN']
+              
+              try:
+                  response = ec2.describe_instances(
+                      Filters=[
+                          {'Name': 'instance-state-name', 'Values': ['running']},
+                          {'Name': f'tag:{tag_key}', 'Values': [tag_value]}
+                      ]
+                  )
+                  
+                  created_alarms = []
+                  
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          alarm_name = f'idle-cpu-{instance_id}'
+                          
+                          try:
+                              cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+                              logger.info(f"Alarm {alarm_name} already exists")
+                              continue
+                          except cloudwatch.exceptions.ClientError:
+                              pass
+                          
+                          cloudwatch.put_metric_alarm(
+                              AlarmName=alarm_name,
+                              ComparisonOperator='LessThanThreshold',
+                              EvaluationPeriods=evaluation_periods,
+                              MetricName='CPUUtilization',
+                              Namespace='AWS/EC2',
+                              Period=300,
+                              Statistic='Average',
+                              Threshold=cpu_threshold,
+                              ActionsEnabled=True,
+                              AlarmActions=[
+                                  f'arn:aws:automate:{context.invoked_function_arn.split(":")[3]}:ec2:stop'
+                              ],
+                              AlarmDescription=f'Stop instance {instance_id} when CPU is idle',
+                              Dimensions=[
+                                  {
+                                      'Name': 'InstanceId',
+                                      'Value': instance_id
+                                  }
+                              ],
+                              Unit='Percent'
+                          )
+                          
+                          created_alarms.append(alarm_name)
+                          logger.info(f"Created alarm {alarm_name} for instance {instance_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Created {len(created_alarms)} alarms',
+                          'alarms': created_alarms
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  AlarmCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-alarm-creator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AlarmCreatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DeleteAlarms
+                  - iam:PassRole
+                Resource: '*'
+
+  AlarmCreatorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-alarm-creator-schedule'
+      Description: 'Schedule to create alarms for new instances'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AlarmCreatorFunction.Arn
+          Id: AlarmCreatorTarget
+
+  AlarmCreatorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlarmCreatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmCreatorSchedule.Arn
+
+  AlarmCreatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-alarm-creator'
+      RetentionInDays: 14
+
+Outputs:
+  AlarmCreatorFunctionArn:
+    Description: 'ARN of the Lambda function that creates CloudWatch alarms'
+    Value: !GetAtt AlarmCreatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-alarm-creator-arn'
+  
+  CloudWatchRoleArn:
+    Description: 'ARN of the role used by CloudWatch to stop instances'
+    Value: !GetAtt CloudWatchShutdownRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudwatch-role-arn'
+  
+  Instructions:
+    Description: 'Instructions for using this template'
+    Value: !Sub 'Tag your instances with ${InstanceTagKey}=${InstanceTagValue} to enable auto-shutdown. Alarms will be created automatically and instances will stop when CPU < ${CPUThresholdPercent}% for ${EvaluationPeriods} periods (5 min each).'

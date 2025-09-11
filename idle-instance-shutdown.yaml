@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to automatically shut down idle EC2 instances'
+
+Parameters:
+  IdleThresholdMinutes:
+    Type: Number
+    Default: 60
+    Description: 'Number of minutes of inactivity before an instance is considered idle'
+    MinValue: 5
+    MaxValue: 1440
+  
+  CPUThresholdPercent:
+    Type: Number
+    Default: 5
+    Description: 'CPU utilization threshold below which an instance is considered idle'
+    MinValue: 1
+    MaxValue: 50
+  
+  NetworkThresholdBytes:
+    Type: Number
+    Default: 1000000
+    Description: 'Network bytes threshold below which an instance is considered idle (1MB default)'
+    MinValue: 100000
+    MaxValue: 100000000
+  
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(15 minutes)'
+    Description: 'How often to check for idle instances (CloudWatch Events schedule expression)'
+  
+  ExcludeInstanceTags:
+    Type: String
+    Default: 'Environment=Production,DoNotShutdown=true'
+    Description: 'Comma-separated list of tag key=value pairs to exclude from shutdown'
+  
+  CrossAccountRoleName:
+    Type: String
+    Default: 'IdleInstanceShutdownRole'
+    Description: 'Name of the IAM role in member accounts that allows EC2 operations'
+  
+  ExcludeAccountIds:
+    Type: String
+    Default: ''
+    Description: 'Comma-separated list of AWS account IDs to exclude from processing (optional)'
+  
+  IncludeAccountIds:
+    Type: String
+    Default: ''
+    Description: 'Comma-separated list of AWS account IDs to include (if empty, processes all accounts)'
+  
+  CrossAccountExternalId:
+    Type: String
+    Default: ''
+    Description: 'Optional external ID to use when assuming the member account role'
+
+Resources:
+  IdleInstanceShutdownRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-idle-instance-shutdown-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IdleInstanceShutdownPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                  - sts:AssumeRole
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  IdleInstanceShutdownFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-idle-instance-shutdown'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IdleInstanceShutdownRole.Arn
+      Timeout: 900
+      Environment:
+        Variables:
+          IDLE_THRESHOLD_MINUTES: !Ref IdleThresholdMinutes
+          CPU_THRESHOLD_PERCENT: !Ref CPUThresholdPercent
+          NETWORK_THRESHOLD_BYTES: !Ref NetworkThresholdBytes
+          EXCLUDE_TAGS: !Ref ExcludeInstanceTags
+          CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
+          EXCLUDE_ACCOUNT_IDS: !Ref ExcludeAccountIds
+          INCLUDE_ACCOUNT_IDS: !Ref IncludeAccountIds
+          CROSS_ACCOUNT_EXTERNAL_ID: !Ref CrossAccountExternalId
+          REGIONS: !Sub '${AWS::Region}'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          import logging
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              org = boto3.client('organizations')
+              sts = boto3.client('sts')
+
+              idle_threshold_minutes = int(os.environ['IDLE_THRESHOLD_MINUTES'])
+              cpu_threshold = float(os.environ['CPU_THRESHOLD_PERCENT'])
+              network_threshold = int(os.environ['NETWORK_THRESHOLD_BYTES'])
+              exclude_tags = parse_tags(os.environ.get('EXCLUDE_TAGS', ''))
+              role_name = os.environ['CROSS_ACCOUNT_ROLE_NAME']
+              external_id = os.environ.get('CROSS_ACCOUNT_EXTERNAL_ID', '').strip()
+              exclude_accounts = parse_id_list(os.environ.get('EXCLUDE_ACCOUNT_IDS', ''))
+              include_accounts = parse_id_list(os.environ.get('INCLUDE_ACCOUNT_IDS', ''))
+              regions = parse_regions(os.environ.get('REGIONS') or os.environ.get('AWS_REGION'))
+
+              current_account = sts.get_caller_identity()['Account']
+              accounts = get_organization_accounts(org)
+              logger.info(f"Found {len(accounts)} active accounts in the organization")
+
+              total_shutdown = 0
+              account_results = {}
+
+              for acct in accounts:
+                  account_id = acct['Id']
+                  account_name = acct.get('Name', '')
+                  if exclude_accounts and account_id in exclude_accounts:
+                      logger.info(f"Skipping excluded account {account_id} ({account_name})")
+                      continue
+                  if include_accounts and account_id not in include_accounts:
+                      logger.info(f"Skipping non-included account {account_id} ({account_name})")
+                      continue
+
+                  creds = None
+                  if account_id != current_account:
+                      role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+                      try:
+                          creds = assume_role(sts, role_arn, external_id if external_id else None)
+                      except ClientError as e:
+                          logger.warning(f"AssumeRole failed for {account_id} ({account_name}): {e}")
+                          account_results[account_id] = {'name': account_name, 'instances_shutdown': 0, 'status': 'assume_failed'}
+                          continue
+
+                  try:
+                      shutdown_count = 0
+                      for region in regions:
+                          ec2 = make_client('ec2', region, creds)
+                          cw = make_client('cloudwatch', region, creds)
+                          shutdown_count += process_region_instances(
+                              ec2, cw, account_id, account_name, region,
+                              idle_threshold_minutes, cpu_threshold, network_threshold, exclude_tags
+                          )
+                      total_shutdown += shutdown_count
+                      account_results[account_id] = {'name': account_name, 'instances_shutdown': shutdown_count, 'status': 'success'}
+                  except Exception as e:
+                      logger.error(f"Error processing account {account_id} ({account_name}): {e}")
+                      account_results[account_id] = {'name': account_name, 'instances_shutdown': 0, 'status': 'error', 'error': str(e)}
+
+              logger.info(f"Total instances shut down across all accounts: {total_shutdown}")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Processed {len(accounts)} accounts; shut down {total_shutdown} instances',
+                      'total_instances_shutdown': total_shutdown,
+                      'account_results': account_results
+                  })
+              }
+
+          def make_client(service, region, creds):
+              if creds:
+                  return boto3.client(
+                      service,
+                      region_name=region,
+                      aws_access_key_id=creds['AccessKeyId'],
+                      aws_secret_access_key=creds['SecretAccessKey'],
+                      aws_session_token=creds['SessionToken']
+                  )
+              else:
+                  return boto3.client(service, region_name=region)
+
+          def assume_role(sts, role_arn, external_id=None):
+              params = {'RoleArn': role_arn, 'RoleSessionName': f'IdleInstanceShutdown'}
+              if external_id:
+                  params['ExternalId'] = external_id
+              return sts.assume_role(**params)['Credentials']
+
+          def get_organization_accounts(org):
+              accounts = []
+              paginator = org.get_paginator('list_accounts')
+              for page in paginator.paginate():
+                  accounts.extend([a for a in page['Accounts'] if a['Status'] == 'ACTIVE'])
+              return accounts
+
+          def parse_tags(tags_str):
+              tags = {}
+              if tags_str:
+                  for pair in tags_str.split(','):
+                      if '=' in pair:
+                          k, v = pair.strip().split('=', 1)
+                          tags[k] = v
+              return tags
+
+          def parse_id_list(s):
+              return set(x.strip() for x in s.split(',') if x.strip()) if s else set()
+
+          def parse_regions(s):
+              items = [x.strip() for x in (s or '').split(',') if x.strip()]
+              return items if items else [os.environ.get('AWS_REGION') or 'us-east-1']
+
+          def process_region_instances(ec2, cloudwatch, account_id, account_name, region,
+                                       threshold_minutes, cpu_threshold, network_threshold, exclude_tags):
+              logger.info(f"[{account_id}:{region}] Scanning running instances")
+              paginator = ec2.get_paginator('describe_instances')
+              filters = [{'Name': 'instance-state-name', 'Values': ['running']}]
+
+              instances_to_shutdown = []
+              for page in paginator.paginate(Filters=filters):
+                  for res in page.get('Reservations', []):
+                      for inst in res.get('Instances', []):
+                          iid = inst['InstanceId']
+                          if should_exclude_instance(inst.get('Tags', []), exclude_tags):
+                              logger.info(f"[{account_id}:{region}] Skipping {iid} due to exclusion tags")
+                              continue
+                          if is_instance_idle(cloudwatch, iid, threshold_minutes, cpu_threshold, network_threshold):
+                              instances_to_shutdown.append(iid)
+
+              total = 0
+              for chunk in chunked(instances_to_shutdown, 100):
+                  if chunk:
+                      logger.info(f"[{account_id}:{region}] Stopping {len(chunk)} instances: {chunk}")
+                      ec2.stop_instances(InstanceIds=chunk)
+                      total += len(chunk)
+              return total
+
+          def chunked(lst, n):
+              for i in range(0, len(lst), n):
+                  yield lst[i:i+n]
+
+          def should_exclude_instance(instance_tags, exclude_tags):
+              if not exclude_tags:
+                  return False
+              tag_map = {t['Key']: t['Value'] for t in (instance_tags or [])}
+              for k, v in exclude_tags.items():
+                  if tag_map.get(k) == v:
+                      return True
+              return False
+
+          def is_instance_idle(cloudwatch, instance_id, threshold_minutes, cpu_threshold, network_threshold):
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(minutes=threshold_minutes)
+              try:
+                  cpu = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/EC2',
+                      MetricName='CPUUtilization',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                      StartTime=start_time, EndTime=end_time,
+                      Period=300, Statistics=['Average']
+                  )
+                  net_in = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/EC2',
+                      MetricName='NetworkIn',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                      StartTime=start_time, EndTime=end_time,
+                      Period=300, Statistics=['Sum']
+                  )
+                  net_out = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/EC2',
+                      MetricName='NetworkOut',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                      StartTime=start_time, EndTime=end_time,
+                      Period=300, Statistics=['Sum']
+                  )
+
+                  if cpu.get('Datapoints'):
+                      avg_cpu = sum(dp['Average'] for dp in cpu['Datapoints']) / len(cpu['Datapoints'])
+                      if avg_cpu > cpu_threshold:
+                          return False
+
+                  total_in = sum(dp['Sum'] for dp in net_in['Datapoints']) if net_in.get('Datapoints') else 0
+                  total_out = sum(dp['Sum'] for dp in net_out['Datapoints']) if net_out.get('Datapoints') else 0
+                  if total_in > network_threshold or total_out > network_threshold:
+                      return False
+                  return True
+              except Exception as e:
+                  logger.error(f"Metric check failed for {instance_id}: {e}")
+                  return False
+
+  IdleInstanceCheckSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-idle-instance-check'
+      Description: 'Schedule to check for idle EC2 instances'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IdleInstanceShutdownFunction.Arn
+          Id: IdleInstanceShutdownTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleInstanceShutdownFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdleInstanceCheckSchedule.Arn
+
+  IdleInstanceShutdownLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-idle-instance-shutdown'
+      RetentionInDays: 14
+
+  IdleInstanceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-idle-instance-notifications'
+      DisplayName: 'Idle Instance Shutdown Notifications'
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function that shuts down idle instances'
+    Value: !GetAtt IdleInstanceShutdownFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-arn'
+  
+  ScheduleRuleArn:
+    Description: 'ARN of the CloudWatch Events rule that triggers the check'
+    Value: !GetAtt IdleInstanceCheckSchedule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-schedule-rule-arn'
+  
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref IdleInstanceNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-sns-topic-arn'
+  
+  Instructions:
+    Description: 'Instructions for using this template'
+    Value: 'Deploy this stack to automatically shut down idle EC2 instances. Configure parameters as needed. Add Environment=Production or DoNotShutdown=true tags to instances you want to exclude.'
